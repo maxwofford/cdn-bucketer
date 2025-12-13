@@ -1,0 +1,30 @@
+# Binary
+migrate
+
+# Database
+state.db
+state.db-shm
+state.db-wal
+
+# Output
+url_mapping.csv
+
+# Environment
+.env
+
+# Ruby
+.bundle/
+vendor/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

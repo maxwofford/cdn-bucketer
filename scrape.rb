@@ -1,0 +1,305 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "bundler/setup"
+require "slack-ruby-client"
+require "dotenv/load"
+require "sqlite3"
+require "optparse"
+require "set"
+
+DB_PATH = "state.db"
+# Captures: domain, index (single digit 0-9), filename
+VERCEL_PATTERN = /https:\/\/([a-z0-9-]+-hack-club-bot\.vercel\.app)\/(\d)([^\s<>)"'|]+)/i
+BOT_USER_ID = "UM1L1C38X"
+
+Options = Struct.new(:limit, :dry_run, :reset)
+
+def parse_options
+  options = Options.new(nil, false, false)
+  
+  OptionParser.new do |opts|
+    opts.banner = "Usage: ruby scrape.rb [options]"
+    
+    opts.on("-l", "--limit N", Integer, "Limit to N URLs (for testing)") do |n|
+      options.limit = n
+    end
+    
+    opts.on("-d", "--dry-run", "Don't write to database, just print URLs") do
+      options.dry_run = true
+    end
+    
+    opts.on("-r", "--reset", "Reset progress and start from beginning") do
+      options.reset = true
+    end
+    
+    opts.on("-h", "--help", "Show this help") do
+      puts opts
+      exit
+    end
+  end.parse!
+  
+  options
+end
+
+def init_db
+  db = SQLite3::Database.new(DB_PATH)
+  db.execute <<-SQL
+    CREATE TABLE IF NOT EXISTS files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      vercel_url TEXT UNIQUE NOT NULL,
+      slack_file_url TEXT,
+      slack_file_id TEXT,
+      filename TEXT,
+      hetzner_url TEXT,
+      status TEXT DEFAULT 'pending',
+      error TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  SQL
+  db.execute "CREATE INDEX IF NOT EXISTS idx_status ON files(status)"
+  db.execute "CREATE INDEX IF NOT EXISTS idx_vercel_url ON files(vercel_url)"
+  
+  # Progress tracking table
+  db.execute <<-SQL
+    CREATE TABLE IF NOT EXISTS scrape_progress (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_page INTEGER DEFAULT 0,
+      last_message_ts TEXT,
+      total_found INTEGER DEFAULT 0,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  SQL
+  
+  # Ensure a row exists
+  db.execute "INSERT OR IGNORE INTO scrape_progress (id) VALUES (1)"
+  
+  db
+end
+
+def get_progress(db)
+  row = db.get_first_row("SELECT last_page, last_message_ts, total_found FROM scrape_progress WHERE id = 1")
+  { page: row[0] || 0, last_ts: row[1], total_found: row[2] || 0 }
+end
+
+def save_progress(db, page, last_ts, total_found)
+  db.execute(
+    "UPDATE scrape_progress SET last_page = ?, last_message_ts = ?, total_found = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+    [page, last_ts, total_found]
+  )
+end
+
+def reset_progress(db)
+  db.execute("UPDATE scrape_progress SET last_page = 0, last_message_ts = NULL, total_found = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1")
+  puts "Progress reset."
+end
+
+def init_slack
+  Slack.configure do |config|
+    config.token = ENV.fetch("SLACK_BOT_TOKEN")
+  end
+  Slack::Web::Client.new
+end
+
+def extract_vercel_urls(text)
+  return [] unless text
+  # Returns array of [full_url, index, filename]
+  text.scan(VERCEL_PATTERN).map do |domain, index, filename|
+    ["https://#{domain}/#{index}#{filename}", index.to_i, filename]
+  end
+end
+
+def with_retry(max_retries: 5, &block)
+  retries = 0
+  begin
+    yield
+  rescue Slack::Web::Api::Errors::TooManyRequestsError => e
+    retries += 1
+    if retries <= max_retries
+      # Parse retry-after from error or default to 10 seconds
+      wait_time = e.message.match(/Retry after (\d+)/i)&.[](1)&.to_i || 10
+      puts "  Rate limited. Waiting #{wait_time}s (retry #{retries}/#{max_retries})..."
+      sleep wait_time + 1
+      retry
+    else
+      raise
+    end
+  rescue Slack::Web::Api::Errors::SlackError => e
+    retries += 1
+    if retries <= max_retries && e.message.include?("timeout")
+      puts "  Timeout. Retrying in 5s (retry #{retries}/#{max_retries})..."
+      sleep 5
+      retry
+    else
+      raise
+    end
+  end
+end
+
+def search_and_scrape(client, db, options)
+  seen_urls = Set.new
+  channel_id = ENV.fetch("SLACK_CHANNEL_ID", "C016DEDUL87")
+  
+  # Load existing URLs to avoid re-processing
+  unless options.dry_run
+    db.execute("SELECT vercel_url FROM files").each do |row|
+      seen_urls.add(row[0])
+    end
+    puts "Loaded #{seen_urls.size} existing URLs from database"
+  end
+  
+  # Get resume point
+  progress = options.dry_run ? { page: 0, total_found: 0 } : get_progress(db)
+  page = progress[:page] + 1  # Start from next page
+  total_urls = progress[:total_found]
+  
+  if page > 1
+    puts "Resuming from page #{page} (#{total_urls} URLs found so far)"
+  end
+
+  loop do
+    break if options.limit && total_urls >= options.limit
+    
+    puts "Searching page #{page}..."
+    
+    response = with_retry do
+      client.search_messages(
+        query: "hack-club-bot.vercel.app in:#cdn from:<@#{BOT_USER_ID}>",
+        count: 100,
+        page: page
+      )
+    end
+
+    matches = response.messages.matches
+    break if matches.empty?
+    
+    last_ts = nil
+
+    matches.each do |search_msg|
+      break if options.limit && total_urls >= options.limit
+      
+      last_ts = search_msg.ts
+      vercel_urls = extract_vercel_urls(search_msg.text)
+      next if vercel_urls.empty?
+      
+      # Skip if we've seen all URLs in this message
+      new_urls = vercel_urls.reject { |url, _, _| seen_urls.include?(url) }
+      next if new_urls.empty?
+      
+      begin
+        msg_response = with_retry do
+          client.conversations_replies(
+            channel: channel_id,
+            ts: search_msg.ts,
+            limit: 1
+          )
+        end
+        msg = msg_response.messages&.first
+        next unless msg&.thread_ts
+        
+        parent_response = with_retry do
+          client.conversations_replies(
+            channel: channel_id,
+            ts: msg.thread_ts,
+            limit: 1
+          )
+        end
+        parent = parent_response.messages&.first
+        files = parent&.files || []
+        
+        vercel_urls.each do |vercel_url, index, filename|
+          next if seen_urls.include?(vercel_url)
+          seen_urls.add(vercel_url)
+          
+          break if options.limit && total_urls >= options.limit
+          
+          slack_file = files[index]
+          slack_file_url = slack_file&.url_private
+          slack_file_id = slack_file&.id
+          
+          if options.dry_run
+            total_urls += 1
+            status = slack_file ? "✓" : "✗"
+            puts "  #{status} #{vercel_url} -> #{filename}"
+          else
+            begin
+              db.execute(
+                "INSERT OR IGNORE INTO files (vercel_url, slack_file_url, slack_file_id, filename) VALUES (?, ?, ?, ?)",
+                [vercel_url, slack_file_url, slack_file_id, filename]
+              )
+              if db.changes > 0
+                total_urls += 1
+                status = slack_file ? "✓" : "✗"
+                puts "  #{status} #{vercel_url} -> #{filename}"
+              end
+            rescue SQLite3::Exception => e
+              puts "  Error inserting #{vercel_url}: #{e.message}"
+            end
+          end
+        end
+        
+      rescue Slack::Web::Api::Errors::SlackError => e
+        puts "  Error fetching thread for #{search_msg.ts}: #{e.message}"
+      end
+    end
+    
+    # Save progress after each page
+    unless options.dry_run
+      save_progress(db, page, last_ts, total_urls)
+    end
+
+    # Check if we've processed all pages
+    total_pages = (response.messages.total.to_f / 100).ceil
+    break if page >= total_pages
+    
+    page += 1
+    
+    # Small delay between pages (rate limiting handled by with_retry)
+    sleep 0.5
+  end
+
+  puts "\nScrape complete!"
+  puts "  URLs found this run: #{total_urls - progress[:total_found]}"
+  puts "  Total URLs: #{total_urls}"
+  
+  unless options.dry_run
+    pending = db.get_first_value("SELECT COUNT(*) FROM files WHERE status = 'pending'")
+    with_slack = db.get_first_value("SELECT COUNT(*) FROM files WHERE slack_file_url IS NOT NULL")
+    without_slack = db.get_first_value("SELECT COUNT(*) FROM files WHERE slack_file_url IS NULL")
+    puts "  Pending: #{pending}"
+    puts "  With Slack file: #{with_slack}"
+    puts "  Missing Slack file: #{without_slack}"
+  end
+end
+
+def main
+  options = parse_options
+  
+  db = nil
+  unless options.dry_run
+    puts "Initializing database..."
+    db = init_db
+    
+    if options.reset
+      reset_progress(db)
+    end
+  end
+
+  puts "Connecting to Slack..."
+  client = init_slack
+
+  limit_msg = options.limit ? " (limit: #{options.limit} URLs)" : ""
+  dry_run_msg = options.dry_run ? " [DRY RUN]" : ""
+  puts "Searching for Vercel URLs#{limit_msg}#{dry_run_msg}..."
+  
+  search_and_scrape(client, db, options)
+rescue Slack::Web::Api::Errors::SlackError => e
+  abort "Slack API error: #{e.message}"
+rescue Interrupt
+  puts "\nInterrupted. Progress saved."
+ensure
+  db&.close
+end
+
+main if __FILE__ == $PROGRAM_NAME
