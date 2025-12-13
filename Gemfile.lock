@@ -30,8 +30,9 @@ GEM
       gli
       hashie
       logger
-    sqlite3 (1.7.3)
+    sqlite3 (2.8.1)
       mini_portile2 (~> 2.8.0)
+    sqlite3 (2.8.1-arm64-darwin)
     uri (1.1.1)
 
 PLATFORMS
@@ -41,7 +42,7 @@ PLATFORMS
 DEPENDENCIES
   dotenv (~> 2.8)
   slack-ruby-client (~> 2.0)
-  sqlite3 (~> 1.6)
+  sqlite3 (~> 2.0)
 
 BUNDLED WITH
    2.7.2
