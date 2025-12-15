@@ -163,13 +163,27 @@ func resetStuckProcessing(db *sql.DB) (int64, error) {
 	return result.RowsAffected()
 }
 
+// convertToDownloadURL converts a Slack files-pri URL to the download variant
+// e.g., .../files-pri/T.../filename.png -> .../files-pri/T.../download/filename.png
+func convertToDownloadURL(fileURL string) string {
+	// Insert /download/ before the filename
+	lastSlash := strings.LastIndex(fileURL, "/")
+	if lastSlash == -1 {
+		return fileURL
+	}
+	return fileURL[:lastSlash] + "/download" + fileURL[lastSlash:]
+}
+
 // downloadFile downloads a file from Slack and returns a reader, content type, and size
 func downloadFile(ctx context.Context, fileURL string, slackToken string) (io.ReadCloser, string, int64, error) {
 	client := &http.Client{Timeout: 5 * time.Minute}
 	maxRetries := 5
 	
+	// Convert to download URL for Enterprise Grid compatibility
+	downloadURL := convertToDownloadURL(fileURL)
+	
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 		if err != nil {
 			return nil, "", 0, err
 		}
