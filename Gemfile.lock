@@ -22,6 +22,13 @@ GEM
     net-http (0.8.0)
       uri (>= 0.11.1)
     ostruct (0.6.3)
+    pg (1.6.3)
+    pg (1.6.3-aarch64-linux)
+    pg (1.6.3-aarch64-linux-musl)
+    pg (1.6.3-arm64-darwin)
+    pg (1.6.3-x86_64-darwin)
+    pg (1.6.3-x86_64-linux)
+    pg (1.6.3-x86_64-linux-musl)
     slack-ruby-client (2.7.0)
       faraday (>= 2.0.1)
       faraday-mashify
@@ -55,6 +62,7 @@ PLATFORMS
 
 DEPENDENCIES
   dotenv (~> 2.8)
+  pg (~> 1.5)
   slack-ruby-client (~> 2.0)
   sqlite3 (~> 2.0)
 

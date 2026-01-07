@@ -7,16 +7,17 @@ require "dotenv/load"
 require "sqlite3"
 require "optparse"
 require "set"
+require "pg"
 
 DB_PATH = "state.db"
 # Captures: domain, index (single digit 0-9), filename
 VERCEL_PATTERN = /https:\/\/([a-z0-9-]+-hack-club-bot\.vercel\.app)\/(\d)([^\s<>)"'|]+)/i
 BOT_USER_ID = "UM1L1C38X"
 
-Options = Struct.new(:limit, :dry_run, :reset)
+Options = Struct.new(:limit, :dry_run, :reset, :skip_scrapbook_lookup)
 
 def parse_options
-  options = Options.new(nil, false, false)
+  options = Options.new(nil, false, false, false)
   
   OptionParser.new do |opts|
     opts.banner = "Usage: ruby scrape.rb [options]"
@@ -31,6 +32,10 @@ def parse_options
     
     opts.on("-r", "--reset", "Reset progress and start from beginning") do
       options.reset = true
+    end
+    
+    opts.on("-s", "--skip-scrapbook-lookup", "Skip looking up slack files for scrapbook entries") do
+      options.skip_scrapbook_lookup = true
     end
     
     opts.on("-h", "--help", "Show this help") do
@@ -60,6 +65,18 @@ def init_db
   SQL
   db.execute "CREATE INDEX IF NOT EXISTS idx_status ON files(status)"
   db.execute "CREATE INDEX IF NOT EXISTS idx_vercel_url ON files(vercel_url)"
+  
+  # Add scrapbook columns if they don't exist
+  begin
+    db.execute "ALTER TABLE files ADD COLUMN scrapbook_channel TEXT"
+  rescue SQLite3::SQLException
+    # Column already exists
+  end
+  begin
+    db.execute "ALTER TABLE files ADD COLUMN scrapbook_ts TEXT"
+  rescue SQLite3::SQLException
+    # Column already exists
+  end
   
   # Progress tracking table
   db.execute <<-SQL
@@ -121,6 +138,15 @@ def with_retry(max_retries: 5, &block)
       wait_time = e.message.match(/Retry after (\d+)/i)&.[](1)&.to_i || 10
       puts "  Rate limited. Waiting #{wait_time}s (retry #{retries}/#{max_retries})..."
       sleep wait_time + 1
+      retry
+    else
+      raise
+    end
+  rescue Slack::Web::Api::Errors::TimeoutError, Faraday::TimeoutError => e
+    retries += 1
+    if retries <= max_retries
+      puts "  Timeout. Retrying in 5s (retry #{retries}/#{max_retries})..."
+      sleep 5
       retry
     else
       raise
@@ -273,6 +299,152 @@ def search_and_scrape(client, db, options)
   end
 end
 
+def lookup_scrapbook_slack_files(client, db, options)
+  # Find files that came from scrapbook but don't have slack URLs yet
+  rows = db.execute(<<~SQL)
+    SELECT id, vercel_url, scrapbook_channel, scrapbook_ts
+    FROM files
+    WHERE scrapbook_channel IS NOT NULL
+    AND scrapbook_ts IS NOT NULL
+    AND (slack_file_url IS NULL OR slack_file_url = '')
+    AND status = 'pending'
+    LIMIT 1000
+  SQL
+  
+  return if rows.empty?
+  
+  puts "Looking up Slack files for #{rows.size} scrapbook entries..."
+  
+  found = 0
+  not_found = 0
+  
+  rows.each do |row|
+    id, vercel_url, channel, ts = row
+    
+    # Extract expected filename and index from vercel URL
+    match = vercel_url.match(/\/(\d)([^\/]+)$/)
+    next unless match
+    index = match[1].to_i
+    filename = match[2]
+    
+    begin
+      # Format timestamp to Slack's expected precision (6 decimal places)
+      ts_formatted = "%.6f" % ts.to_f
+      response = with_retry do
+        client.conversations_history(
+          channel: channel,
+          oldest: ts_formatted,
+          latest: ts_formatted,
+          inclusive: true,
+          limit: 1
+        )
+      end
+      
+      msg = response.messages&.first
+      files = msg&.files || []
+      
+      if files.empty?
+        not_found += 1
+        next
+      end
+      
+      # Try to match by index first, then by filename
+      slack_file = files[index] || files.find { |f| f.name == filename } || files.first
+      
+      if slack_file
+        db.execute(
+          "UPDATE files SET slack_file_url = ?, slack_file_id = ?, filename = ? WHERE id = ?",
+          [slack_file.url_private, slack_file.id, slack_file.name, id]
+        )
+        found += 1
+        puts "  ✓ #{vercel_url} -> #{slack_file.name}"
+      else
+        not_found += 1
+      end
+      
+    rescue Slack::Web::Api::Errors::SlackError => e
+      puts "  ✗ #{vercel_url}: #{e.message}"
+      not_found += 1
+    end
+    
+    # Small delay to avoid rate limits
+    sleep 0.2
+  end
+  
+  puts "  Found #{found} slack files, #{not_found} not found"
+end
+
+def import_from_scrapbook(db)
+  scrapbook_url = ENV["SCRAPBOOK_DB_URL"]
+  return 0 unless scrapbook_url
+  
+  puts "Connecting to Scrapbook database..."
+  
+  # Add sslmode=disable if not present
+  unless scrapbook_url.include?("sslmode=")
+    scrapbook_url += scrapbook_url.include?("?") ? "&sslmode=disable" : "?sslmode=disable"
+  end
+  
+  begin
+    pg = PG.connect(scrapbook_url)
+  rescue PG::Error => e
+    puts "  Warning: Could not connect to Scrapbook DB: #{e.message}"
+    return 0
+  end
+  
+  puts "  Querying Scrapbook for vercel URLs..."
+  
+  result = pg.exec(<<~SQL)
+    SELECT id, channel, "messageTimestamp", attachments
+    FROM "Updates"
+    WHERE attachments IS NOT NULL
+    AND array_length(attachments, 1) > 0
+  SQL
+  
+  imported = 0
+  skipped = 0
+  
+  result.each do |row|
+    attachments = row["attachments"]
+    channel = row["channel"]
+    message_ts = row["messageTimestamp"]
+    
+    # Parse PostgreSQL array format: {url1,url2,...}
+    next unless attachments
+    next if channel.nil? || channel.empty? || message_ts.nil?
+    
+    urls = attachments.gsub(/^\{|\}$/, "").split(",").map(&:strip)
+    
+    urls.each do |url|
+      next unless url.include?("vercel.app")
+      
+      begin
+        db.execute(
+          "INSERT OR IGNORE INTO files (vercel_url, scrapbook_channel, scrapbook_ts, status) VALUES (?, ?, ?, 'pending')",
+          [url, channel, message_ts]
+        )
+        if db.changes > 0
+          imported += 1
+        else
+          # Update existing entry with scrapbook info if missing
+          db.execute(
+            "UPDATE files SET scrapbook_channel = ?, scrapbook_ts = ? WHERE vercel_url = ? AND scrapbook_channel IS NULL",
+            [channel, message_ts, url]
+          )
+          skipped += 1
+        end
+      rescue SQLite3::Exception => e
+        puts "  Error inserting #{url}: #{e.message}"
+      end
+    end
+  end
+  
+  pg.close
+  
+  puts "  Imported #{imported} URLs from Scrapbook, skipped #{skipped} duplicates"
+  imported
+end
+
 def main
   options = parse_options
   
@@ -284,10 +456,20 @@ def main
     if options.reset
       reset_progress(db)
     end
+    
+    # Import from Scrapbook if SCRAPBOOK_DB_URL is set
+    if ENV["SCRAPBOOK_DB_URL"]
+      import_from_scrapbook(db)
+    end
   end
 
   puts "Connecting to Slack..."
   client = init_slack
+
+  # Look up slack files for scrapbook entries first
+  unless options.dry_run || options.skip_scrapbook_lookup
+    lookup_scrapbook_slack_files(client, db, options)
+  end
 
   limit_msg = options.limit ? " (limit: #{options.limit} URLs)" : ""
   dry_run_msg = options.dry_run ? " [DRY RUN]" : ""
