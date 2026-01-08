@@ -204,6 +204,72 @@ def with_retry(max_retries: 5, &block)
   end
 end
 
+def process_message(worker_id, client, channel_id, search_msg, seen_urls, db, options, results_mutex, stats)
+  vercel_urls = extract_vercel_urls(search_msg.text)
+  return if vercel_urls.empty?
+  
+  # Skip if we've seen all URLs in this message
+  new_urls = results_mutex.synchronize { vercel_urls.reject { |url, _, _| seen_urls.include?(url) } }
+  return if new_urls.empty?
+  
+  begin
+    msg_response = with_retry do
+      client.conversations_replies(
+        channel: channel_id,
+        ts: search_msg.ts,
+        limit: 1
+      )
+    end
+    msg = msg_response.messages&.first
+    return unless msg&.thread_ts
+    
+    parent_response = with_retry do
+      client.conversations_replies(
+        channel: channel_id,
+        ts: msg.thread_ts,
+        limit: 1
+      )
+    end
+    parent = parent_response.messages&.first
+    files = parent&.files || []
+    
+    vercel_urls.each do |vercel_url, index, filename|
+      results_mutex.synchronize do
+        return if options.limit && stats[:total] >= options.limit
+        next if seen_urls.include?(vercel_url)
+        seen_urls.add(vercel_url)
+        
+        slack_file = files[index]
+        slack_file_url = slack_file&.url_private
+        slack_file_id = slack_file&.id
+        
+        if options.dry_run
+          stats[:total] += 1
+          status = slack_file ? "✓" : "✗"
+          puts "  [W#{worker_id}] #{status} #{vercel_url} -> #{filename}"
+        else
+          begin
+            db.execute(
+              "INSERT OR IGNORE INTO files (vercel_url, slack_file_url, slack_file_id, filename) VALUES (?, ?, ?, ?)",
+              [vercel_url, slack_file_url, slack_file_id, filename]
+            )
+            if db.changes > 0
+              stats[:total] += 1
+              status = slack_file ? "✓" : "✗"
+              puts "  [W#{worker_id}] #{status} #{vercel_url} -> #{filename}"
+            end
+          rescue SQLite3::Exception => e
+            puts "  [W#{worker_id}] Error inserting #{vercel_url}: #{e.message}"
+          end
+        end
+      end
+    end
+    
+  rescue Slack::Web::Api::Errors::SlackError => e
+    puts "  [W#{worker_id}] Error fetching thread for #{search_msg.ts}: #{e.message}"
+  end
+end
+
 def search_and_scrape(client, rotator, db, options)
   seen_urls = Set.new
   channel_id = ENV.fetch("SLACK_CHANNEL_ID", "C016DEDUL87")
@@ -219,18 +285,41 @@ def search_and_scrape(client, rotator, db, options)
   # Get resume point
   progress = options.dry_run ? { page: 0, total_found: 0 } : get_progress(db)
   page = progress[:page] + 1  # Start from next page
-  total_urls = progress[:total_found]
+  stats = { total: progress[:total_found] }
   
   if page > 1
-    puts "Resuming from page #{page} (#{total_urls} URLs found so far)"
+    puts "Resuming from page #{page} (#{stats[:total]} URLs found so far)"
   end
+  
+  # Create worker pool - one Slack client per token
+  num_workers = rotator.count
+  work_queue = Queue.new
+  results_mutex = Mutex.new
+  
+  workers = num_workers.times.map do |i|
+    Thread.new do
+      # Each worker gets its own Slack client with dedicated token
+      worker_client = Slack::Web::Client.new
+      worker_client.token = rotator.next
+      
+      while (job = work_queue.pop)
+        break if job == :shutdown
+        process_message(i + 1, worker_client, channel_id, job, seen_urls, db, options, results_mutex, stats)
+      end
+    end
+  end
+  
+  puts "Started #{num_workers} workers"
 
+  # Coordinator: search pages and enqueue messages
   loop do
-    break if options.limit && total_urls >= options.limit
+    break if options.limit && stats[:total] >= options.limit
     
     puts "Searching page #{page}..."
     
-    client.token = rotator.next
+    # Use first token for search (coordinator)
+    client.token = rotator.first
+    
     response = with_retry do
       client.search_messages(
         query: "hack-club-bot.vercel.app in:#cdn from:<@#{BOT_USER_ID}>",
@@ -245,78 +334,17 @@ def search_and_scrape(client, rotator, db, options)
     last_ts = nil
 
     matches.each do |search_msg|
-      break if options.limit && total_urls >= options.limit
-      
+      break if options.limit && stats[:total] >= options.limit
       last_ts = search_msg.ts
-      vercel_urls = extract_vercel_urls(search_msg.text)
-      next if vercel_urls.empty?
-      
-      # Skip if we've seen all URLs in this message
-      new_urls = vercel_urls.reject { |url, _, _| seen_urls.include?(url) }
-      next if new_urls.empty?
-      
-      begin
-        client.token = rotator.next
-        msg_response = with_retry do
-          client.conversations_replies(
-            channel: channel_id,
-            ts: search_msg.ts,
-            limit: 1
-          )
-        end
-        msg = msg_response.messages&.first
-        next unless msg&.thread_ts
-        
-        client.token = rotator.next
-        parent_response = with_retry do
-          client.conversations_replies(
-            channel: channel_id,
-            ts: msg.thread_ts,
-            limit: 1
-          )
-        end
-        parent = parent_response.messages&.first
-        files = parent&.files || []
-        
-        vercel_urls.each do |vercel_url, index, filename|
-          next if seen_urls.include?(vercel_url)
-          seen_urls.add(vercel_url)
-          
-          break if options.limit && total_urls >= options.limit
-          
-          slack_file = files[index]
-          slack_file_url = slack_file&.url_private
-          slack_file_id = slack_file&.id
-          
-          if options.dry_run
-            total_urls += 1
-            status = slack_file ? "✓" : "✗"
-            puts "  #{status} #{vercel_url} -> #{filename}"
-          else
-            begin
-              db.execute(
-                "INSERT OR IGNORE INTO files (vercel_url, slack_file_url, slack_file_id, filename) VALUES (?, ?, ?, ?)",
-                [vercel_url, slack_file_url, slack_file_id, filename]
-              )
-              if db.changes > 0
-                total_urls += 1
-                status = slack_file ? "✓" : "✗"
-                puts "  #{status} #{vercel_url} -> #{filename}"
-              end
-            rescue SQLite3::Exception => e
-              puts "  Error inserting #{vercel_url}: #{e.message}"
-            end
-          end
-        end
-        
-      rescue Slack::Web::Api::Errors::SlackError => e
-        puts "  Error fetching thread for #{search_msg.ts}: #{e.message}"
-      end
+      work_queue << search_msg
     end
+    
+    # Wait for queue to drain before saving progress
+    sleep 0.1 until work_queue.empty?
     
     # Save progress after each page
     unless options.dry_run
-      save_progress(db, page, last_ts, total_urls)
+      save_progress(db, page, last_ts, stats[:total])
     end
 
     # Check if we've processed all pages
@@ -324,14 +352,15 @@ def search_and_scrape(client, rotator, db, options)
     break if page >= total_pages
     
     page += 1
-    
-    # Small delay between pages (rate limiting handled by with_retry)
-    sleep 0.5
   end
+  
+  # Shutdown workers
+  num_workers.times { work_queue << :shutdown }
+  workers.each(&:join)
 
   puts "\nScrape complete!"
-  puts "  URLs found this run: #{total_urls - progress[:total_found]}"
-  puts "  Total URLs: #{total_urls}"
+  puts "  URLs found this run: #{stats[:total] - progress[:total_found]}"
+  puts "  Total URLs: #{stats[:total]}"
   
   unless options.dry_run
     pending = db.get_first_value("SELECT COUNT(*) FROM files WHERE status = 'pending'")
