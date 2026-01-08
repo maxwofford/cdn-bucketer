@@ -96,7 +96,6 @@ func loadConfig() (*Config, error) {
 		uploadWorkers = 10
 	}
 
-	slackTokens := NewTokenRotator(os.Getenv("SLACK_BOT_TOKEN"))
 	slackTokens := NewTokenRotator(os.Getenv("SLACK_BOT_TOKENS"))
 
 	cfg := &Config{
@@ -214,16 +213,16 @@ func convertToDownloadURL(fileURL string) string {
 func downloadFile(ctx context.Context, fileURL string, slackToken string) (io.ReadCloser, string, int64, error) {
 	client := &http.Client{Timeout: 5 * time.Minute}
 	maxRetries := 5
-	
+
 	// Convert to download URL for Enterprise Grid compatibility
 	downloadURL := convertToDownloadURL(fileURL)
-	
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 		if err != nil {
 			return nil, "", 0, err
 		}
-		
+
 		// Slack private files require auth
 		req.Header.Set("Authorization", "Bearer "+slackToken)
 
@@ -239,9 +238,9 @@ func downloadFile(ctx context.Context, fileURL string, slackToken string) (io.Re
 			}
 			return resp.Body, contentType, resp.ContentLength, nil
 		}
-		
+
 		resp.Body.Close()
-		
+
 		// Handle rate limiting (429)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := resp.Header.Get("Retry-After")
@@ -260,10 +259,10 @@ func downloadFile(ctx context.Context, fileURL string, slackToken string) (io.Re
 				continue
 			}
 		}
-		
+
 		return nil, "", 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	
+
 	return nil, "", 0, fmt.Errorf("max retries exceeded (429)")
 }
 
@@ -278,10 +277,10 @@ func generateS3Key(vercelURL string, filename string) string {
 
 	// Extract subdomain for organization (e.g., "cloud-abc123" from "cloud-abc123-hack-club-bot.vercel.app")
 	subdomain := strings.Split(parsed.Host, "-hack-club-bot")[0]
-	
+
 	// Get the index from the path (e.g., "0" from "/0filename.png")
 	pathPart := strings.TrimPrefix(parsed.Path, "/")
-	
+
 	// Use provided filename, fallback to path-based extraction
 	if filename == "" {
 		filename = path.Base(parsed.Path)
@@ -302,7 +301,7 @@ func uploadToS3(ctx context.Context, client *s3.Client, bucket string, key strin
 		Body:        body,
 		ContentType: aws.String(contentType),
 	}
-	
+
 	if contentLength > 0 {
 		input.ContentLength = aws.Int64(contentLength)
 	}
