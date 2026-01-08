@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -410,6 +411,9 @@ func printStats(db *sql.DB) {
 }
 
 func main() {
+	limit := flag.Int("limit", 0, "Limit number of files to process (0 = unlimited)")
+	flag.Parse()
+
 	cfg, err := loadConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
@@ -478,6 +482,7 @@ func main() {
 
 	// Feed files to workers
 	batchSize := 100
+	processed := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -485,7 +490,19 @@ func main() {
 		default:
 		}
 
-		files, err := getPendingFiles(db, batchSize)
+		// Check limit
+		if *limit > 0 && processed >= *limit {
+			fmt.Printf("Reached limit of %d files.\n", *limit)
+			break
+		}
+
+		// Adjust batch size if near limit
+		fetchSize := batchSize
+		if *limit > 0 && processed+batchSize > *limit {
+			fetchSize = *limit - processed
+		}
+
+		files, err := getPendingFiles(db, fetchSize)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error fetching files: %v\n", err)
 			time.Sleep(time.Second)
@@ -504,6 +521,7 @@ func main() {
 			default:
 				markProcessing(db, f.ID)
 				fileChan <- f
+				processed++
 			}
 		}
 	}
