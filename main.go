@@ -46,9 +46,42 @@ type Config struct {
 	HetznerSecretKey string
 	HetznerBucket    string
 	HetznerPublicURL string
-	SlackToken       string
+	SlackTokens      *TokenRotator
 	DownloadWorkers  int
 	UploadWorkers    int
+}
+
+type TokenRotator struct {
+	tokens []string
+	index  int
+	mu     sync.Mutex
+}
+
+func NewTokenRotator(tokenStr string) *TokenRotator {
+	tokens := strings.Split(tokenStr, ",")
+	cleaned := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			cleaned = append(cleaned, t)
+		}
+	}
+	return &TokenRotator{tokens: cleaned}
+}
+
+func (r *TokenRotator) Next() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.tokens) == 0 {
+		return ""
+	}
+	token := r.tokens[r.index]
+	r.index = (r.index + 1) % len(r.tokens)
+	return token
+}
+
+func (r *TokenRotator) Count() int {
+	return len(r.tokens)
 }
 
 func loadConfig() (*Config, error) {
@@ -63,13 +96,15 @@ func loadConfig() (*Config, error) {
 		uploadWorkers = 10
 	}
 
+	slackTokens := NewTokenRotator(os.Getenv("SLACK_BOT_TOKEN"))
+
 	cfg := &Config{
 		HetznerEndpoint:  os.Getenv("HETZNER_ENDPOINT"),
 		HetznerAccessKey: os.Getenv("HETZNER_ACCESS_KEY"),
 		HetznerSecretKey: os.Getenv("HETZNER_SECRET_KEY"),
 		HetznerBucket:    os.Getenv("HETZNER_BUCKET_NAME"),
 		HetznerPublicURL: os.Getenv("HETZNER_PUBLIC_URL"),
-		SlackToken:       os.Getenv("SLACK_BOT_TOKEN"),
+		SlackTokens:      slackTokens,
 		DownloadWorkers:  downloadWorkers,
 		UploadWorkers:    uploadWorkers,
 	}
@@ -77,7 +112,7 @@ func loadConfig() (*Config, error) {
 	if cfg.HetznerEndpoint == "" || cfg.HetznerAccessKey == "" || cfg.HetznerSecretKey == "" || cfg.HetznerBucket == "" {
 		return nil, fmt.Errorf("missing required Hetzner configuration")
 	}
-	if cfg.SlackToken == "" {
+	if slackTokens.Count() == 0 {
 		return nil, fmt.Errorf("missing SLACK_BOT_TOKEN")
 	}
 
@@ -300,8 +335,9 @@ func worker(
 				VercelURL: file.VercelURL,
 			}
 
-			// Download from Slack (not Vercel)
-			body, contentType, contentLength, err := downloadFile(ctx, file.SlackFileURL, cfg.SlackToken)
+			// Download from Slack (not Vercel) - rotate through tokens
+			slackToken := cfg.SlackTokens.Next()
+			body, contentType, contentLength, err := downloadFile(ctx, file.SlackFileURL, slackToken)
 			if err != nil {
 				result.Error = fmt.Errorf("download failed: %w", err)
 				results <- result
@@ -386,6 +422,8 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+
+	fmt.Printf("Loaded %d Slack bot tokens for rotation\n", cfg.SlackTokens.Count())
 
 	// Reset any files stuck in 'processing' state from previous run
 	reset, _ := resetStuckProcessing(db)
