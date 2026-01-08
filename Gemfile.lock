@@ -1,6 +1,27 @@
 GEM
   remote: https://rubygems.org/
   specs:
+    aws-eventstream (1.4.0)
+    aws-partitions (1.1201.0)
+    aws-sdk-core (3.241.2)
+      aws-eventstream (~> 1, >= 1.3.0)
+      aws-partitions (~> 1, >= 1.992.0)
+      aws-sigv4 (~> 1.9)
+      base64
+      bigdecimal
+      jmespath (~> 1, >= 1.6.1)
+      logger
+    aws-sdk-kms (1.119.0)
+      aws-sdk-core (~> 3, >= 3.241.0)
+      aws-sigv4 (~> 1.5)
+    aws-sdk-s3 (1.210.1)
+      aws-sdk-core (~> 3, >= 3.241.0)
+      aws-sdk-kms (~> 1)
+      aws-sigv4 (~> 1.5)
+    aws-sigv4 (1.12.1)
+      aws-eventstream (~> 1, >= 1.0.2)
+    base64 (0.3.0)
+    bigdecimal (4.0.1)
     dotenv (2.8.1)
     faraday (2.14.0)
       faraday-net_http (>= 2.0, < 3.5)
@@ -16,6 +37,7 @@ GEM
     gli (2.22.2)
       ostruct
     hashie (5.0.0)
+    jmespath (1.6.2)
     json (2.18.0)
     logger (1.7.0)
     multipart-post (2.4.1)
@@ -29,6 +51,7 @@ GEM
     pg (1.6.3-x86_64-darwin)
     pg (1.6.3-x86_64-linux)
     pg (1.6.3-x86_64-linux-musl)
+    rexml (3.4.4)
     slack-ruby-client (2.7.0)
       faraday (>= 2.0.1)
       faraday-mashify
@@ -61,8 +84,10 @@ PLATFORMS
   x86_64-linux-musl
 
 DEPENDENCIES
+  aws-sdk-s3 (~> 1.0)
   dotenv (~> 2.8)
   pg (~> 1.5)
+  rexml (~> 3.0)
   slack-ruby-client (~> 2.0)
   sqlite3 (~> 2.0)
 
