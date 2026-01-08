@@ -14,10 +14,40 @@ DB_PATH = "state.db"
 VERCEL_PATTERN = /https:\/\/([a-z0-9-]+-hack-club-bot\.vercel\.app)\/(\d)([^\s<>)"'|]+)/i
 BOT_USER_ID = "UM1L1C38X"
 
-Options = Struct.new(:limit, :dry_run, :reset, :skip_scrapbook_lookup)
+class TokenRotator
+  attr_accessor :debug
+
+  def initialize(token_str)
+    @tokens = token_str.to_s.split(",").map(&:strip).reject(&:empty?)
+    @index = 0
+    @mutex = Mutex.new
+    @debug = false
+  end
+
+  def next
+    @mutex.synchronize do
+      return nil if @tokens.empty?
+      token = @tokens[@index]
+      idx = @index + 1
+      @index = (@index + 1) % @tokens.size
+      puts "    [token #{idx}/#{@tokens.size}]" if @debug
+      token
+    end
+  end
+
+  def count
+    @tokens.size
+  end
+
+  def first
+    @tokens.first
+  end
+end
+
+Options = Struct.new(:limit, :dry_run, :reset, :skip_scrapbook_lookup, :debug)
 
 def parse_options
-  options = Options.new(nil, false, false, false)
+  options = Options.new(nil, false, false, false, false)
   
   OptionParser.new do |opts|
     opts.banner = "Usage: ruby scrape.rb [options]"
@@ -36,6 +66,10 @@ def parse_options
     
     opts.on("-s", "--skip-scrapbook-lookup", "Skip looking up slack files for scrapbook entries") do
       options.skip_scrapbook_lookup = true
+    end
+    
+    opts.on("--debug", "Show token rotation debug info") do
+      options.debug = true
     end
     
     opts.on("-h", "--help", "Show this help") do
@@ -113,10 +147,17 @@ def reset_progress(db)
 end
 
 def init_slack
-  Slack.configure do |config|
-    config.token = ENV.fetch("SLACK_BOT_TOKEN")
-  end
-  Slack::Web::Client.new
+  # Support both SLACK_BOT_TOKENS (comma-separated) and SLACK_BOT_TOKEN (single)
+  token_str = ENV["SLACK_BOT_TOKENS"] || ENV["SLACK_BOT_TOKEN"]
+  raise "Missing SLACK_BOT_TOKENS or SLACK_BOT_TOKEN" if token_str.nil? || token_str.empty?
+  
+  rotator = TokenRotator.new(token_str)
+  puts "Loaded #{rotator.count} Slack token(s)"
+  
+  # Don't configure globally - we'll set token per-request
+  client = Slack::Web::Client.new
+  
+  [client, rotator]
 end
 
 def extract_vercel_urls(text)
@@ -163,7 +204,7 @@ def with_retry(max_retries: 5, &block)
   end
 end
 
-def search_and_scrape(client, db, options)
+def search_and_scrape(client, rotator, db, options)
   seen_urls = Set.new
   channel_id = ENV.fetch("SLACK_CHANNEL_ID", "C016DEDUL87")
   
@@ -189,6 +230,7 @@ def search_and_scrape(client, db, options)
     
     puts "Searching page #{page}..."
     
+    client.token = rotator.next
     response = with_retry do
       client.search_messages(
         query: "hack-club-bot.vercel.app in:#cdn from:<@#{BOT_USER_ID}>",
@@ -214,6 +256,7 @@ def search_and_scrape(client, db, options)
       next if new_urls.empty?
       
       begin
+        client.token = rotator.next
         msg_response = with_retry do
           client.conversations_replies(
             channel: channel_id,
@@ -224,6 +267,7 @@ def search_and_scrape(client, db, options)
         msg = msg_response.messages&.first
         next unless msg&.thread_ts
         
+        client.token = rotator.next
         parent_response = with_retry do
           client.conversations_replies(
             channel: channel_id,
@@ -299,7 +343,7 @@ def search_and_scrape(client, db, options)
   end
 end
 
-def lookup_scrapbook_slack_files(client, db, options)
+def lookup_scrapbook_slack_files(client, rotator, db, options)
   # Find files that came from scrapbook but don't have slack URLs yet
   rows = db.execute(<<~SQL)
     SELECT id, vercel_url, scrapbook_channel, scrapbook_ts
@@ -330,6 +374,7 @@ def lookup_scrapbook_slack_files(client, db, options)
     begin
       # Format timestamp to Slack's expected precision (6 decimal places)
       ts_formatted = "%.6f" % ts.to_f
+      client.token = rotator.next
       response = with_retry do
         client.conversations_history(
           channel: channel,
@@ -464,18 +509,19 @@ def main
   end
 
   puts "Connecting to Slack..."
-  client = init_slack
+  client, rotator = init_slack
+  rotator.debug = options.debug
 
   # Look up slack files for scrapbook entries first
   unless options.dry_run || options.skip_scrapbook_lookup
-    lookup_scrapbook_slack_files(client, db, options)
+    lookup_scrapbook_slack_files(client, rotator, db, options)
   end
 
   limit_msg = options.limit ? " (limit: #{options.limit} URLs)" : ""
   dry_run_msg = options.dry_run ? " [DRY RUN]" : ""
   puts "Searching for Vercel URLs#{limit_msg}#{dry_run_msg}..."
   
-  search_and_scrape(client, db, options)
+  search_and_scrape(client, rotator, db, options)
 rescue Slack::Web::Api::Errors::SlackError => e
   abort "Slack API error: #{e.message}"
 rescue Interrupt
