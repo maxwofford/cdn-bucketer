@@ -97,6 +97,7 @@ func loadConfig() (*Config, error) {
 	}
 
 	slackTokens := NewTokenRotator(os.Getenv("SLACK_BOT_TOKEN"))
+	slackTokens := NewTokenRotator(os.Getenv("SLACK_BOT_TOKENS"))
 
 	cfg := &Config{
 		HetznerEndpoint:  os.Getenv("HETZNER_ENDPOINT"),
