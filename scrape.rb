@@ -401,14 +401,16 @@ def lookup_scrapbook_slack_files(client, rotator, db, options)
     filename = match[2]
     
     begin
-      # Format timestamp to Slack's expected precision (6 decimal places)
-      ts_formatted = "%.6f" % ts.to_f
+      # Use a small range (±1ms) to account for timestamp precision loss
+      ts_float = ts.to_f
+      ts_oldest = "%.6f" % (ts_float - 0.001)
+      ts_latest = "%.6f" % (ts_float + 0.001)
       client.token = rotator.next
       response = with_retry do
         client.conversations_history(
           channel: channel,
-          oldest: ts_formatted,
-          latest: ts_formatted,
+          oldest: ts_oldest,
+          latest: ts_latest,
           inclusive: true,
           limit: 1
         )
