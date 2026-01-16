@@ -373,81 +373,83 @@ def search_and_scrape(client, rotator, db, options)
 end
 
 def lookup_scrapbook_slack_files(client, rotator, db, options)
-  # Find files that came from scrapbook but don't have slack URLs yet
-  rows = db.execute(<<~SQL)
-    SELECT id, vercel_url, scrapbook_channel, scrapbook_ts
-    FROM files
-    WHERE scrapbook_channel IS NOT NULL
-    AND scrapbook_ts IS NOT NULL
-    AND (slack_file_url IS NULL OR slack_file_url = '')
-    AND status = 'pending'
-    LIMIT 1000
-  SQL
-  
-  return if rows.empty?
-  
-  puts "Looking up Slack files for #{rows.size} scrapbook entries..."
-  
-  found = 0
-  not_found = 0
-  
-  rows.each do |row|
-    id, vercel_url, channel, ts = row
-    
-    # Extract expected filename and index from vercel URL
-    match = vercel_url.match(/\/(\d)([^\/]+)$/)
-    next unless match
-    index = match[1].to_i
-    filename = match[2]
-    
-    begin
-      # Use a small range (±1ms) to account for timestamp precision loss
-      ts_float = ts.to_f
-      ts_oldest = "%.6f" % (ts_float - 0.001)
-      ts_latest = "%.6f" % (ts_float + 0.001)
-      client.token = rotator.next
-      response = with_retry do
-        client.conversations_history(
-          channel: channel,
-          oldest: ts_oldest,
-          latest: ts_latest,
-          inclusive: true,
-          limit: 1
-        )
-      end
-      
-      msg = response.messages&.first
-      files = msg&.files || []
-      
-      if files.empty?
+  loop do
+    # Find files that came from scrapbook but don't have slack URLs yet
+    rows = db.execute(<<~SQL)
+      SELECT id, vercel_url, scrapbook_channel, scrapbook_ts
+      FROM files
+      WHERE scrapbook_channel IS NOT NULL
+      AND scrapbook_ts IS NOT NULL
+      AND (slack_file_url IS NULL OR slack_file_url = '')
+      AND status = 'pending'
+      LIMIT 1000
+    SQL
+
+    break if rows.empty?
+
+    puts "Looking up Slack files for #{rows.size} scrapbook entries..."
+
+    found = 0
+    not_found = 0
+
+    rows.each do |row|
+      id, vercel_url, channel, ts = row
+
+      # Extract expected filename and index from vercel URL
+      match = vercel_url.match(/\/(\d)([^\/]+)$/)
+      next unless match
+      index = match[1].to_i
+      filename = match[2]
+
+      begin
+        # Use a small range (±1ms) to account for timestamp precision loss
+        ts_float = ts.to_f
+        ts_oldest = "%.6f" % (ts_float - 0.001)
+        ts_latest = "%.6f" % (ts_float + 0.001)
+        client.token = rotator.next
+        response = with_retry do
+          client.conversations_history(
+            channel: channel,
+            oldest: ts_oldest,
+            latest: ts_latest,
+            inclusive: true,
+            limit: 1
+          )
+        end
+
+        msg = response.messages&.first
+        files = msg&.files || []
+
+        if files.empty?
+          not_found += 1
+          next
+        end
+
+        # Try to match by index first, then by filename
+        slack_file = files[index] || files.find { |f| f.name == filename } || files.first
+
+        if slack_file
+          db.execute(
+            "UPDATE files SET slack_file_url = ?, slack_file_id = ?, filename = ? WHERE id = ?",
+            [slack_file.url_private, slack_file.id, slack_file.name, id]
+          )
+          found += 1
+          puts "  ✓ #{vercel_url} -> #{slack_file.name}"
+        else
+          not_found += 1
+        end
+
+      rescue Slack::Web::Api::Errors::SlackError => e
+        puts "  ✗ #{vercel_url}: #{e.message}"
         not_found += 1
-        next
       end
-      
-      # Try to match by index first, then by filename
-      slack_file = files[index] || files.find { |f| f.name == filename } || files.first
-      
-      if slack_file
-        db.execute(
-          "UPDATE files SET slack_file_url = ?, slack_file_id = ?, filename = ? WHERE id = ?",
-          [slack_file.url_private, slack_file.id, slack_file.name, id]
-        )
-        found += 1
-        puts "  ✓ #{vercel_url} -> #{slack_file.name}"
-      else
-        not_found += 1
-      end
-      
-    rescue Slack::Web::Api::Errors::SlackError => e
-      puts "  ✗ #{vercel_url}: #{e.message}"
-      not_found += 1
+
+      # Small delay to avoid rate limits
+      sleep 0.2
     end
-    
-    # Small delay to avoid rate limits
-    sleep 0.2
+
+    puts "  Found #{found} slack files, #{not_found} not found"
   end
-  
-  puts "  Found #{found} slack files, #{not_found} not found"
 end
 
 def import_from_scrapbook(db)
